@@ -1,0 +1,62 @@
+menu "Zigbee probe"
+
+config PROBE_TOUCHLINK_MASTER_KEY
+    string "Touchlink master key, 32 hex characters"
+    default ""
+    help
+        The Touchlink master key, index 4, is a shared secret used by certified
+        Touchlink devices to encrypt the transferred network key. It is not
+        included in this SDK and is not published here. Leave empty to use the
+        SDK defaults, which advertise both the certification and master keys and
+        prefer the certification key because it has the higher bit.
+
+        When set, the key is installed and only the master key is advertised, so
+        there is no ambiguity about which key the two sides selected.
+
+config PROBE_ROLE_ROUTER
+    bool "Join as a router instead of forming a network as coordinator"
+    default n
+    help
+        A coordinator forms its own network and cannot be adopted by a remote
+        that is off network. Touchlink from such a remote creates a network and
+        pulls the target into it, so the target must be a joinable router.
+        Enable this to test Touchlink against a factory reset remote.
+
+config PROBE_WIFI_SSID
+    string "Wi-Fi SSID for log shipping"
+    default ""
+    help
+        Leave empty to disable Wi-Fi and log only over serial -- which the
+        Zigbee stack tends to kill a few seconds after boot.
+
+config PROBE_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+config PROBE_WIFI_SCAN_ON_BOOT
+    bool "Log a Wi-Fi scan at boot"
+    default n
+    help
+        Lists every visible AP with channel and signal, and marks the
+        configured SSID. Useful when association fails with NO_AP_FOUND.
+
+config PROBE_WIFI_COUNTRY
+    string "Wi-Fi country code"
+    default "01"
+    help
+        Two-letter code, e.g. NL, DE, US. The default "01" is world-safe mode
+        and only scans channels 1-11; set your country if your AP sits on
+        channel 12 or 13, or it will never be found.
+
+config PROBE_LOG_UDP_TARGET
+    string "UDP target for log lines"
+    default "255.255.255.255"
+    help
+        Broadcast by default, so no host address has to be configured.
+        Set a specific address if your network blocks broadcast.
+
+config PROBE_LOG_UDP_PORT
+    int "UDP port for log lines"
+    default 5555
+
+endmenu

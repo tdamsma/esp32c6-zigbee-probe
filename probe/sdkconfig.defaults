@@ -1,0 +1,12 @@
+CONFIG_IDF_TARGET="esp32c6"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+CONFIG_FREERTOS_HZ=1000
+
+# Full RF calibration at every boot. With the default partial calibration
+# this board's Wi-Fi receiver found zero access points while BLE and
+# 802.15.4 worked, and full calibration fixed it. Costs ~100 ms of boot.
+CONFIG_ESP_PHY_RF_CAL_FULL=y
