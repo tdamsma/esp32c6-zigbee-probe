@@ -13,10 +13,13 @@ three channels apart, because the channel is only visible in the group address
 of a groupcast and a joined remote does not use one.
 
 Touchlink would fix that. It reaches network setup and then fails during secured
-communication. The handshake completes on our side, the target joins, group
-membership succeeds, and then every frame from the remote is rejected with bad
-key sequence number. Explicit configuration of a production master key is the
-obvious next thing to try and has not been tested.
+communication. From a genuinely factory new board the handshake completes, the
+network parameters are the remote's own, the target joins at short address
+0x0002 alongside the initiator at 0x0001, group membership succeeds, the target
+holds fresh non degenerate key material, and then every frame from the remote is
+rejected with bad key sequence number. Sweeping the key sequence number does not
+help. Explicit configuration of a production master key remains untested with a
+verified key value.
 
 ## Goal
 
@@ -234,6 +237,86 @@ The quiet period is explained by the remote no longer sending post commissioning
 traffic, not necessarily by the key switch. The remote abandons the result and
 restarts its search, which matches its LED continuing to blink throughout.
 
+## Step 9: a clean run from a genuinely factory new board
+
+Steps 4 to 8 all shared a defect that was only found afterwards. The board was
+reset between attempts but its flash was never erased, so it carried network
+state from the previous Touchlink into the next one. Instrumenting the network
+identity at boot made this visible:
+
+```
+run A  before touchlink: pan 0x5609 ext_pan 9c139efffecc0afc channel 15 short 0x0002
+run B  before touchlink: pan 0x4f65 ext_pan 9c139efffecc0afc channel 15 short 0x0002
+```
+
+A target that is not factory new takes a different Touchlink path than a fresh
+one, so those runs are weaker evidence than they looked. In run B the target
+signal returned `ESP_FAIL` and `ESP_ZB_BDB_SIGNAL_TOUCHLINK_TARGET_FINISHED`
+never fired at all, which means the group registrations and the key sequence
+sweep of step 8 never executed in that run.
+
+The run was repeated after `idf.py erase-flash` and a reflash, with the remote
+factory reset as well. The baseline was then genuinely factory new:
+
+```
+before touchlink: pan 0xffff ext_pan 0000000000000000 channel 255 short 0xfffe
+```
+
+From that state Touchlink completed properly:
+
+```
+TOUCHLINK request, action=0 -- allowing
+touchlink network: pan 0xbbef ext_pan 9c139efffecc0afc channel 20 short 0x0002
+target finished:   pan 0xbbef ext_pan 9c139efffecc0afc channel 20 short 0x0002
+group 21658 on endpoint 1: ESP_OK
+group 21659 on endpoint 1: ESP_OK
+group 21660 on endpoint 1: ESP_OK
+```
+
+Three things follow from those identity lines.
+
+The channel is 20, while the probe's own mask is channels 25 and 26. The remote
+chose it, and it differs from the 15 seen in the earlier runs, so nothing was
+cached from a previous attempt.
+
+Our short address is 0x0002 and the rejected frames come from 0x0001, which is
+the ordinary initiator and target pair. The two sides are on one network with
+sensible addresses. An earlier hypothesis, that Touchlink had left the probe on
+a network of its own making with a separate key, is therefore wrong.
+
+The extended PAN id equals the board's own EUI-64 even from a clean erase. That
+is ZBOSS using its own address when asked to start the network, not evidence of
+a second network.
+
+The key material was fresh, different from the earlier run, and again not
+degenerate. The full key was read back on a later boot, since flashing the
+application without erasing leaves NVS intact:
+
+```
+before touchlink: network key 008cf15f...
+```
+
+The sequence sweep then ran to completion, which it had not done before:
+
+```
+network key starts 008cf15f, switching to seq 0
+key switch to seq 0: ESP_OK
+network key starts 008cf15f, switching to seq 1
+key switch to seq 1: ESP_OK
+network key starts 008cf15f, switching to seq 2
+key switch to seq 2: ESP_OK
+```
+
+Throughout the run the remote's buttons were pressed repeatedly, so there was
+real traffic to accept or reject at every setting. The result was 80 status
+indications, every one of them 0x12 from 0x0001, no other status value, and not
+a single frame ever decoded to a ZCL command.
+
+This makes the sequence number sweep a clean negative rather than the
+inconclusive result recorded in step 8. All three plausible sequence numbers
+were applied, each switch was accepted by the stack, and the rejections
+continued unchanged.
+
 ## Conclusion
 
 Touchlink reaches network setup and fails during secured communication.
@@ -254,8 +337,14 @@ confirmed against a published source.
 The key the target ends up holding is plausible material rather than a
 degenerate value, which argues against a failed key exchange.
 
-The sequence number sweep was inconclusive, because the remote changed behaviour
-at the same time.
+The sequence number sweep is a clean negative once it is run from a factory new
+board, as described in step 9. All three plausible sequence numbers were applied
+and accepted, traffic was present throughout, and the rejections continued
+unchanged.
+
+The network layer is not the problem. The negotiated PAN id, channel and short
+addresses are all the remote's own, so the two devices are on one network and
+the failure is confined to security.
 
 The honest state is that Touchlink negotiates, the target joins with usable
 looking key material, the initiator is never satisfied and resumes scanning, and
@@ -288,7 +377,10 @@ The next experiment, in order:
    installs it and then advertises the master key only, so the selected key is
    unambiguous.
 2. Keep `PROBE_ROLE_ROUTER` enabled, erase flash on the board and factory reset
-   the remote, so neither side carries stale network state.
+   the remote, so neither side carries stale network state. Confirm the baseline
+   really is factory new by checking that the boot line reads
+   `pan 0xffff ext_pan 0000000000000000 channel 255 short 0xfffe`. Resetting the
+   board is not enough, the flash must be erased.
 3. Repeat step 4 and watch two things: whether the remote's LED stops blinking,
    and whether `NLME status 0x12` disappears.
 4. If 0x12 persists, capture the exchange over the air and check which key index

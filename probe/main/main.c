@@ -24,6 +24,7 @@
 #include "zdo/esp_zigbee_zdo_command.h"
 #include "test/esp_zigbee_test_utils.h"
 #include "esp_zigbee_secur.h"
+#include "nwk/esp_zigbee_nwk.h"
 #include "zboss_api.h"
 #include "driver/gpio.h"
 #include "led_strip.h"
@@ -223,6 +224,37 @@ static void install_master_key(void)
     ESP_LOGW(TAG, "master key installed, advertising master key only");
 }
 
+/* Which network are we actually on? Touchlink can start a network as well as
+ * join one, and the signal does not say which happened. If the parameters here
+ * are not the remote's, the two sides are on separate networks with separate
+ * keys, which is enough on its own to explain rejected frames. */
+static void report_network(const char *when)
+{
+    esp_zb_ieee_addr_t ext_pan = {0}, me = {0};
+    esp_zb_get_extended_pan_id(ext_pan);
+    esp_zb_get_long_address(me);
+    ESP_LOGW(TAG, "%s: pan 0x%04hx ext_pan %02x%02x%02x%02x%02x%02x%02x%02x "
+                  "channel %d short 0x%04hx",
+             when, esp_zb_get_pan_id(),
+             ext_pan[7], ext_pan[6], ext_pan[5], ext_pan[4],
+             ext_pan[3], ext_pan[2], ext_pan[1], ext_pan[0],
+             esp_zb_get_current_channel(), esp_zb_get_short_address());
+}
+
+/* Print the whole key so a sniffer capture can be decrypted offline. */
+static void report_network_key(const char *when)
+{
+    uint8_t k[16] = {0};
+    if (esp_zb_secur_primary_network_key_get(k) != ESP_OK) {
+        ESP_LOGW(TAG, "%s: no network key", when);
+        return;
+    }
+    ESP_LOGW(TAG, "%s: network key "
+             "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             when, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+             k[8], k[9], k[10], k[11], k[12], k[13], k[14], k[15]);
+}
+
 /* NWK status 0x12 says a frame arrived with a key sequence number we do not
  * hold. Report the key we ended up with, then try the plausible sequence
  * numbers in turn. If one of them stops the errors, the key material was fine
@@ -230,6 +262,7 @@ static void install_master_key(void)
 static void try_key_sequence(uint8_t param)
 {
     const uint8_t seq = (uint8_t)param;
+    report_network("after touchlink");
     uint8_t key[16] = {0};
     if (esp_zb_secur_primary_network_key_get(key) != ESP_OK) {
         ESP_LOGE(TAG, "cannot read network key");
@@ -310,6 +343,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal)
              * accept. Only a joinable router or end device can be a target. */
             ESP_LOGW(TAG, "router role: waiting as a touchlink target, do not "
                           "expect a network of our own");
+            report_network("before touchlink");
+            report_network_key("before touchlink");
             esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_TOUCHLINK_TARGET);
         } else if (esp_zb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "no network stored, forming one");
@@ -331,6 +366,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal)
         }
         break;
 
+    case ESP_ZB_BDB_SIGNAL_TOUCHLINK_NWK:
+        report_network("touchlink network");
+        break;
+
     case ESP_ZB_NLME_STATUS_INDICATION: {
         esp_zb_zdo_signal_nwk_status_indication_params_t *n =
             (esp_zb_zdo_signal_nwk_status_indication_params_t *)
@@ -343,6 +382,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal)
     }
 
     case ESP_ZB_BDB_SIGNAL_TOUCHLINK_TARGET_FINISHED:
+        report_network("target finished");
         esp_zb_scheduler_alarm(try_key_sequence, 0, 8000);
         for (size_t i = 0; i < sizeof(PROBE_GROUPS) / sizeof(PROBE_GROUPS[0]); i++) {
             const esp_err_t g = esp_zb_aps_group_table_add_group(PROBE_GROUPS[i],
