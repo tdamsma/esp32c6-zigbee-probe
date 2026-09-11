@@ -39,9 +39,15 @@ Zigbee stack runs.
 
 This does not work on this SDK version. With `CONFIG_ZB_RADIO_NATIVE=y` the
 Wi-Fi receiver finds zero access points and every connect fails with reason 201,
-NO_AP_FOUND, even when the Zigbee task is never started. Espressif rates single
-chip Wi-Fi plus Zigbee as supported but unstable and recommends a dual SoC
-design for gateways. The code is kept because it is complete and works in a
+NO_AP_FOUND, even when the Zigbee task is never started. The underlying reason
+is that the C6 has a single RF path: Wi-Fi and 802.15.4 cannot receive
+simultaneously, with what Espressif calls a significant impact on performance
+([esp-matter#1790](https://github.com/espressif/esp-matter/discussions/1790)),
+and no dynamic multiprotocol support is planned. ESPHome takes the same
+position at build time, refusing to compile Zigbee together with OpenThread or
+a Wi-Fi access point
+([esphome#16499](https://github.com/esphome/esphome/pull/16499), merged
+2026-05-19). Espressif recommends a dual SoC design for gateways. The code is kept because it is complete and works in a
 build without Zigbee, but on this hardware the LED indications below remain the
 practical way to see what is happening.
 
@@ -118,6 +124,12 @@ APS data indication provides `esp_zb_apsde_data_ind_t`, which reports
 `dst_addr_mode=0x02` and `dst_short_addr=0xfffd` for these frames, the group ID
 having already been resolved away.
 
+This is a general gap rather than a missing call somewhere. The SDK exposes no
+public API to read the bind or report tables either
+([esp-zigbee-sdk#848](https://github.com/espressif/esp-zigbee-sdk/issues/848)),
+so an application is expected to infer routing state from its own endpoint and
+group membership rather than read it off the wire.
+
 What the parsed header does carry is the APS frame control, so a groupcast can
 at least be told apart from a real broadcast. Bits 2 and 3 of `fc` are the
 delivery mode, where 3 means group:
@@ -158,6 +170,12 @@ fired. A remote that is off network does not join an existing network during
 Touchlink. It creates one and adopts the target, which a coordinator cannot
 accept. Keep `PROBE_ROLE_ROUTER` enabled.
 
+Espressif has since confirmed this is by design rather than an SDK defect.
+[esp-zigbee-sdk#781](https://github.com/espressif/esp-zigbee-sdk/issues/781)
+records the same failure from a coordinator-role attempt on ESP-IDF v5.5.2, and
+maintainer xieqinan states that Touchlink only works on distributed networks,
+pointing at the SDK's distributed-network Touchlink example.
+
 **No automatic key sequence switching.** Every frame being rejected with
 
 ```
@@ -177,6 +195,11 @@ index is unambiguous. It is required: with the SDK default, which advertises
 both keys and prefers the certification key, commissioning still completes but
 every subsequent frame is rejected with status 0x12 and no traffic ever arrives.
 Tested 2026-09-11, step 11 of the investigation. See below for where to get it.
+
+This code calls `esp_zb_zdo_touchlink_set_master_key()`, the v1.x API, matching
+the `~1.6` pin in `probe/main/idf_component.yml`. Upgrading to esp-zigbee-sdk
+v2.x renames it to `ezb_touchlink_set_master_key`; see Espressif's
+[v2.x commissioning migration guide](https://docs.espressif.com/projects/esp-zigbee-sdk/en/latest/esp32h2/migration-guide/v2.x/commissioning.html).
 
 **One endpoint per group**, as described above, which is what makes the channel
 readable.
@@ -271,6 +294,12 @@ no LED, remove the LED code and use Wi-Fi or serial logging.
 
 - [ikea-bilresa-e2490](https://github.com/tdamsma/ikea-bilresa-e2490) documents the remote's Matter endpoints, events, sleep behaviour, and Zigbee mode.
 - [esp32c6-matter-thread-controller](https://github.com/tdamsma/esp32c6-matter-thread-controller) provides the Matter controller firmware used for the BILRESA measurements.
+
+No other public ESP32 project doing Touchlink work against IKEA hardware turned
+up when this was written. ZHA has a device quirk for the BILRESA dual-button
+sibling (E2489) but none for the E2490 scroll wheel used here, and community
+attempts to bring the rest of IKEA's Matter generation onto Zigbee have mostly
+gone unrecorded.
 
 ## Licence
 
