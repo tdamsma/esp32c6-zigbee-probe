@@ -811,6 +811,13 @@ static void install_master_key(void)
         if (strlen(hex) != 0) {
             ESP_LOGE(TAG, "master key must be 32 hex characters, ignoring");
         }
+        /* Loud, because the failure it causes looks like success: Touchlink
+         * commissions, and then every frame is rejected with NWK status 0x12.
+         * Anyone who gets that far without reading the docs should be told
+         * here rather than left to debug it. */
+        ESP_LOGW(TAG, "no Touchlink master key set. Commissioning will appear "
+                      "to work and no traffic will arrive. See the README "
+                      "section 'The ZLL Master Key' for where to get it.");
         return;
     }
     uint8_t key[16];

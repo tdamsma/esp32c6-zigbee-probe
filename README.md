@@ -171,13 +171,12 @@ now a one shot for deliberate use, and nothing switches the key on its own. The
 switch persists across a reboot, so a board left in this state stays broken
 until the sequence is put back.
 
-**The ZLL Master Key, advertised alone.** `PROBE_TOUCHLINK_MASTER_KEY` set to
-the ZLL Master Key `9F55************************EE31`, leaked by MayaZigBee in 2015, makes the probe advertise the master key,
-index 4, on its own, so the selected key index is unambiguous. It is required:
-with the SDK default, which advertises both keys and prefers the certification
-key, commissioning still completes but every subsequent frame is rejected with
-status 0x12 and no traffic ever arrives. Tested 2026-09-11, step 11 of the
-investigation.
+**The ZLL Master Key, advertised alone.** `PROBE_TOUCHLINK_MASTER_KEY` makes
+the probe advertise the master key, index 4, on its own, so the selected key
+index is unambiguous. It is required: with the SDK default, which advertises
+both keys and prefers the certification key, commissioning still completes but
+every subsequent frame is rejected with status 0x12 and no traffic ever arrives.
+Tested 2026-09-11, step 11 of the investigation. See below for where to get it.
 
 **One endpoint per group**, as described above, which is what makes the channel
 readable.
@@ -186,6 +185,33 @@ The remote must be factory reset first. While it was commissioned over Matter,
 the four press Touchlink sequence produced nothing. A reset remote can only bind
 channel 1; channel 2 becomes selectable once channel 1 is bound, and channel 3
 once channel 2 is.
+
+### The ZLL Master Key
+
+Not in this repository. You have to supply it, and Touchlink will not work
+without it.
+
+It is the ZigBee Light Link master key, index 4, 16 bytes, written as 32 hex
+characters that begin `9F55` and end `EE31`. It is not a secret and has not been
+one since March 2015:
+
+- Posted by MayaZigBee on [2015-03-22](https://xcancel.com/MayaZigBee/status/579723961661022209).
+- Discussed on Hacker News the next day,
+  [Zigbee light link master key](https://news.ycombinator.com/item?id=9249753).
+  The value was redacted there after a DMCA takedown request, so that thread
+  establishes the date and the attribution but no longer carries it.
+- Reposted to Pastebin on 2015-03-29, which is still up.
+- Carried as a default in ZigBee security tooling, including
+  [Z3sec](https://github.com/IoTsec/Z3sec), which needs it for the same reason
+  this probe does.
+- Documented in the academic literature on ZLL Touchlink, for example
+  [IoT Goes Nuclear](https://eprint.iacr.org/2016/1047.pdf).
+
+Searching for "ZLL master key" finds it immediately. Set it with `idf.py
+menuconfig` under **Zigbee probe**, or put it in `sdkconfig.defaults`.
+
+No other key was tested. `c22114def...`, which circulated from the same account
+in 2016, was never tried.
 
 ### Serial console
 

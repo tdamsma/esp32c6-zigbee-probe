@@ -521,7 +521,8 @@ Restoring the key and repeating the same procedure on the same hardware
 minutes later pairs and delivers traffic. The two runs differ in the key alone.
 
 So the answer is that the master key is required, and the caveat attached to
-10.2 is resolved. `c22114def...` was not tested, because
+10.2 is resolved. `c22114def...`, a second key that circulated from the same account in 2016,
+was not tested either, because
 the question it was being held in reserve for is now answered.
 
 Note what this does not say. It does not say the certification key is rejected

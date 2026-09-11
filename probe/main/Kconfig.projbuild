@@ -16,10 +16,15 @@ config PROBE_TOUCHLINK_MASTER_KEY
         follows is rejected with NWK status 0x12, so the remote pairs and does
         nothing. Measured 2026-09-11, step 11 of TOUCHLINK-INVESTIGATION.md.
 
-        sdkconfig.defaults carries the ZLL Master Key
-        9F55************************EE31, leaked by MayaZigBee in 2015 and
-        republished ever since, so it is not a secret this repo is keeping. It
-        is the value that works here; no other key was tested.
+        The value is not in this repository and you have to supply it. The one
+        that works is the ZLL Master Key, 32 hex characters beginning 9F55 and
+        ending EE31. It is not secret. It was posted by MayaZigBee on
+        2015-03-22, discussed on Hacker News the next day at
+        news.ycombinator.com/item?id=9249753, reposted to Pastebin a week later,
+        and has been carried in ZigBee penetration testing tools such as Z3sec
+        ever since. Searching for "ZLL master key" finds it in seconds.
+
+        No other key was tested, c22114def... included.
 
 config PROBE_ROLE_ROUTER
     bool "Join as a router instead of forming a network as coordinator"
