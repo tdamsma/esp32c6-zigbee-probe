@@ -22,16 +22,21 @@
 #include "ha/esp_zigbee_ha_standard.h"
 #include "bdb/esp_zigbee_bdb_touchlink.h"
 #include "zdo/esp_zigbee_zdo_command.h"
+#include "aps/esp_zigbee_aps.h"
 #include "test/esp_zigbee_test_utils.h"
 #include "esp_zigbee_secur.h"
 #include "nwk/esp_zigbee_nwk.h"
 #include "zboss_api.h"
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
 #include "wifi_log.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include "esp_system.h"
 
 /* The ZBOSS stack destabilises the C6's native USB-Serial-JTAG, so serial
  * logs cut out. The on-board RGB reports what happened instead:
@@ -50,6 +55,13 @@
  * receives a groupcast if its endpoint is a member of that group, so join all
  * three to see traffic from any channel. */
 static const uint16_t PROBE_GROUPS[] = {21658, 21659, 21660};
+#define PROBE_GROUP_COUNT (sizeof(PROBE_GROUPS) / sizeof(PROBE_GROUPS[0]))
+
+/* The SDK's APS callback reports a groupcast as a plain broadcast and drops
+ * the group id, so the group cannot be read off the frame. Giving each group
+ * its own endpoint puts the channel back in a field that does survive:
+ * a frame for 21659 is delivered to endpoint 2 and nowhere else. */
+#define PROBE_EP_OF_CHANNEL(i) ((uint8_t)(PROBE_ENDPOINT + (i)))
 #define PERMIT_JOIN_S  180
 
 /* Zigbee and Wi-Fi share one radio, so a coordinator on a channel that
@@ -71,6 +83,439 @@ static void led_set(uint8_t r, uint8_t g, uint8_t b)
     led_strip_refresh(s_led);
 }
 
+/* The wheel is one control for two parameters, so a click swaps which one it
+ * drives. BILRESA sends alternating On/Off for a single click, a
+ * manufacturer-specific arrow command for a double click, and MoveToLevel
+ * while rotating. See bilresa-e2490-reference.md section 7.
+ *
+ * Which gesture does what is runtime state, not compile-time state: the
+ * serial console below rebinds it, so trying a different mapping does not
+ * mean rebuilding and reflashing, which would cost the Touchlink pairing. */
+
+typedef enum {
+    ACT_NONE = 0,   /* ignore the gesture */
+    ACT_MODE,       /* swap between hue and brightness */
+    ACT_ONOFF,      /* toggle the light */
+    ACT_ACTIVE,     /* drive whichever parameter is currently selected */
+    ACT_HUE,        /* always drive hue */
+    ACT_BRIGHT,     /* always drive brightness */
+    ACT_SAT,        /* always drive saturation */
+    ACT_BLINK,      /* always drive blink rate */
+    ACT_COUNT,
+} light_action_t;
+
+typedef enum { GEST_CLICK = 0, GEST_DOUBLE, GEST_SCROLL, GEST_COUNT } gesture_t;
+
+typedef enum { LIGHT_MODE_BRIGHT = 0, LIGHT_MODE_HUE } light_mode_t;
+
+/* Packed so it can go to NVS as one blob and survive the reset that the
+ * capture script does on every connect. */
+typedef struct {
+    uint8_t map[GEST_COUNT];
+    uint8_t chan[3];    /* scroll action per BILRESA channel, 1-3 */
+    uint8_t mode;
+    uint8_t on;
+    uint16_t hue;       /* degrees, 0-359 */
+    uint8_t sat;
+    uint8_t bright;
+    uint8_t blink;      /* 0 steady, otherwise faster as it rises */
+} light_cfg_t;
+
+static light_cfg_t s_cfg = {
+    .map = {[GEST_CLICK] = ACT_MODE,
+            [GEST_DOUBLE] = ACT_ONOFF,
+            [GEST_SCROLL] = ACT_ACTIVE},
+    /* The remote's channel is the only per-gesture context we get, so give
+     * each one its own parameter rather than sharing one wheel. */
+    .chan = {ACT_BRIGHT, ACT_HUE, ACT_BLINK},
+    .mode = LIGHT_MODE_BRIGHT,
+    .on = 1,
+    .hue = 30,
+    .sat = 255,
+    .bright = 160,
+};
+
+static volatile bool s_light_seen;      /* a command has arrived */
+static volatile int s_mode_blips;
+static volatile int s_rx_blip;         /* one white flash per command */
+static TickType_t s_last_blip;
+static volatile uint16_t s_last_dst = 0xffff;   /* NWK destination last seen */
+static volatile uint16_t s_last_group;          /* group of the last frame, 0 if none */
+static volatile int s_last_channel = -1;        /* 0-2, from the endpoint */
+static volatile bool s_rxlog = true;
+static volatile uint16_t s_filter;      /* 0 = accept any destination */
+
+static void report_network(const char *when);
+static void regroup_now(void);
+static void report_network_key(const char *when);
+static void try_key_sequence(uint8_t param);
+
+static const char *ACT_NAMES[ACT_COUNT] = {
+    "none", "mode", "onoff", "active", "hue", "bright", "sat", "blink",
+};
+static const char *GEST_NAMES[GEST_COUNT] = {"click", "double", "scroll"};
+
+#define LIGHT_NVS_NS  "light"
+#define LIGHT_NVS_KEY "cfg"
+
+static void light_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(LIGHT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, LIGHT_NVS_KEY, &s_cfg, sizeof(s_cfg));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void light_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(LIGHT_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(s_cfg);
+    light_cfg_t tmp;
+    if (nvs_get_blob(h, LIGHT_NVS_KEY, &tmp, &len) == ESP_OK &&
+        len == sizeof(tmp)) {
+        bool sane = tmp.mode <= LIGHT_MODE_HUE && tmp.hue < 360;
+        for (int g = 0; g < GEST_COUNT; g++)
+            if (tmp.map[g] >= ACT_COUNT) sane = false;
+        for (int c = 0; c < 3; c++)
+            if (tmp.chan[c] >= ACT_COUNT) sane = false;
+        if (sane) s_cfg = tmp;
+    }
+    nvs_close(h);
+}
+
+static void hsv_to_rgb(uint16_t h, uint8_t s, uint8_t v,
+                       uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    const uint8_t region = h / 60;
+    const uint16_t rem = (h - region * 60) * 255 / 60;
+    const uint8_t p = (uint16_t)v * (255 - s) / 255;
+    const uint8_t q = (uint16_t)v * (255 - (uint32_t)s * rem / 255) / 255;
+    const uint8_t t = (uint16_t)v * (255 - (uint32_t)s * (255 - rem) / 255) / 255;
+    switch (region % 6) {
+    case 0:  *r = v; *g = t; *b = p; break;
+    case 1:  *r = q; *g = v; *b = p; break;
+    case 2:  *r = p; *g = v; *b = t; break;
+    case 3:  *r = p; *g = q; *b = v; break;
+    case 4:  *r = t; *g = p; *b = v; break;
+    default: *r = v; *g = p; *b = q; break;
+    }
+}
+
+static void light_render(void)
+{
+    if (!s_cfg.on) {
+        led_set(0, 0, 0);
+        return;
+    }
+    uint8_t r, g, b;
+    hsv_to_rgb(s_cfg.hue, s_cfg.sat, s_cfg.bright, &r, &g, &b);
+    led_set(r, g, b);
+}
+
+static void light_swap_mode(void)
+{
+    s_cfg.mode = (s_cfg.mode == LIGHT_MODE_HUE) ? LIGHT_MODE_BRIGHT
+                                                : LIGHT_MODE_HUE;
+    s_mode_blips = 2;
+    ESP_LOGW(TAG, "LIGHT mode=%s",
+             s_cfg.mode == LIGHT_MODE_HUE ? "hue" : "bright");
+}
+
+/* Rotating sends a ramp of MoveToLevel steps across the transition, so
+ * driving the parameter straight from the attribute gives smooth movement. */
+static void light_set_param(light_action_t act, uint8_t level)
+{
+    if (level > 254) level = 254;   /* the remote can send an out-of-spec 255 */
+    if (act == ACT_ACTIVE)
+        act = (s_cfg.mode == LIGHT_MODE_HUE) ? ACT_HUE : ACT_BRIGHT;
+    switch (act) {
+    case ACT_HUE:    s_cfg.hue = (uint16_t)level * 359 / 254; break;
+    case ACT_SAT:    s_cfg.sat = level; break;
+    case ACT_BRIGHT: s_cfg.bright = level; break;
+    case ACT_BLINK:  s_cfg.blink = level; break;
+    default: break;
+    }
+}
+
+/* Rate limited: rotating sends about ten level steps a second, and a flash on
+ * every one of them reads as a strobe rather than as confirmation. */
+static void light_blip(void)
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (now - s_last_blip < pdMS_TO_TICKS(250)) return;
+    s_last_blip = now;
+    s_rx_blip = 1;
+}
+
+static void light_gesture(gesture_t g, uint8_t level)
+{
+    light_action_t act = s_cfg.map[g];
+    const int ch = s_last_channel;
+    if (g == GEST_SCROLL && ch >= 0) act = s_cfg.chan[ch];
+    /* filter 0 means act on everything; otherwise only on that group, which
+     * is how a single BILRESA channel gets isolated once the remote actually
+     * groupcasts rather than broadcasts. */
+    if (s_filter && s_last_group != s_filter) {
+        ESP_LOGW(TAG, "LIGHT ignored, group=%u filter=%u",
+                 s_last_group, s_filter);
+        return;
+    }
+    s_light_seen = true;
+    light_blip();
+    switch (act) {
+    case ACT_NONE:  break;
+    case ACT_MODE:  light_swap_mode(); break;
+    case ACT_ONOFF:
+        s_cfg.on = !s_cfg.on;
+        ESP_LOGW(TAG, "LIGHT %s", s_cfg.on ? "on" : "off");
+        break;
+    default: light_set_param(act, level); break;
+    }
+}
+
+static int action_from_name(const char *s)
+{
+    for (int i = 0; i < ACT_COUNT; i++)
+        if (strcmp(s, ACT_NAMES[i]) == 0) return i;
+    return -1;
+}
+
+static void light_status(void)
+{
+    printf("light on=%d mode=%s hue=%u sat=%u bright=%u blink=%u\n", s_cfg.on,
+           s_cfg.mode == LIGHT_MODE_HUE ? "hue" : "bright", s_cfg.hue,
+           s_cfg.sat, s_cfg.bright, s_cfg.blink);
+    for (int c = 0; c < 3; c++)
+        printf("chan %d (group %u) -> %s\n", c + 1, PROBE_GROUPS[c],
+               ACT_NAMES[s_cfg.chan[c]]);
+    for (int g = 0; g < GEST_COUNT; g++)
+        printf("map %s -> %s\n", GEST_NAMES[g], ACT_NAMES[s_cfg.map[g]]);
+}
+
+static void console_help(void)
+{
+    printf("commands:\n"
+           "  status                     show light state and gesture map\n"
+           "  on | off | toggle          light power\n"
+           "  hue <0-359>                set hue\n"
+           "  sat <0-255>                set saturation\n"
+           "  bright <0-255>             set brightness\n"
+           "  hsv <h> <s> <v>            set all three\n"
+           "  mode hue|bright            which parameter the wheel drives\n"
+           "  chan <1-3> <action>        scroll role per remote channel\n"
+           "  blink <0-254>              0 steady, higher is faster\n"
+           "  map <click|double|scroll> <none|mode|onoff|active|hue|bright|sat>\n"
+           "  blip                       flash white once, to test the LED\n"
+           "zigbee:\n"
+           "  pair                       arm Touchlink target, then 4 presses\n"
+           "  steer | open [secs]        plain join / permit joining\n"
+           "  net                        pan, channel, short address, key\n"
+           "  groups | group <id>        group membership, one endpoint per channel\n"
+           "  filter <any|group>         only act on that group, eg 21658\n"
+           "  radio <11-26>              primary channel for next commissioning\n"
+           "  keyseq <n|off>             switch key sequence, or stop the sweep\n"
+           "  rxlog on|off               per-frame logging\n"
+           "  factory yes | reboot       wipe the pairing / restart\n"
+           "  save | load | defaults     gesture map and colour in NVS\n"
+           "  help\n");
+}
+
+static void console_line(char *line)
+{
+    char *save = NULL;
+    const char *cmd = strtok_r(line, " \t", &save);
+    if (!cmd) return;
+    const char *a1 = strtok_r(NULL, " \t", &save);
+    const char *a2 = strtok_r(NULL, " \t", &save);
+    const char *a3 = strtok_r(NULL, " \t", &save);
+
+    if (!strcmp(cmd, "help")) {
+        console_help();
+    } else if (!strcmp(cmd, "status")) {
+        light_status();
+    } else if (!strcmp(cmd, "on") || !strcmp(cmd, "off")) {
+        s_cfg.on = (cmd[1] == 'n');
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "toggle")) {
+        s_cfg.on = !s_cfg.on;
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "hue") && a1) {
+        s_cfg.hue = (uint16_t)(atoi(a1) % 360);
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "sat") && a1) {
+        s_cfg.sat = (uint8_t)atoi(a1);
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "bright") && a1) {
+        s_cfg.bright = (uint8_t)atoi(a1);
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "hsv") && a1 && a2 && a3) {
+        s_cfg.hue = (uint16_t)(atoi(a1) % 360);
+        s_cfg.sat = (uint8_t)atoi(a2);
+        s_cfg.bright = (uint8_t)atoi(a3);
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "mode") && a1) {
+        s_cfg.mode = !strcmp(a1, "hue") ? LIGHT_MODE_HUE : LIGHT_MODE_BRIGHT;
+    } else if (!strcmp(cmd, "map") && a1 && a2) {
+        int g = -1, act = action_from_name(a2);
+        for (int i = 0; i < GEST_COUNT; i++)
+            if (!strcmp(a1, GEST_NAMES[i])) g = i;
+        if (g < 0 || act < 0) {
+            printf("bad map, try: map scroll active\n");
+        } else {
+            s_cfg.map[g] = (uint8_t)act;
+            printf("map %s -> %s\n", GEST_NAMES[g], ACT_NAMES[act]);
+        }
+    } else if (!strcmp(cmd, "pair")) {
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            esp_zb_bdb_start_top_level_commissioning(
+                ESP_ZB_BDB_MODE_TOUCHLINK_TARGET);
+            esp_zb_lock_release();
+            printf("touchlink target armed, 4 rapid presses on the remote\n");
+        } else {
+            printf("stack busy\n");
+        }
+    } else if (!strcmp(cmd, "steer")) {
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            esp_zb_bdb_start_top_level_commissioning(
+                ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            esp_zb_lock_release();
+            printf("network steering started\n");
+        }
+    } else if (!strcmp(cmd, "open")) {
+        const int secs = a1 ? atoi(a1) : PERMIT_JOIN_S;
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            esp_zb_bdb_open_network((uint8_t)secs);
+            esp_zb_lock_release();
+            printf("network open for %d s\n", secs);
+        }
+    } else if (!strcmp(cmd, "net")) {
+        report_network("now");
+        report_network_key("now");
+        printf("last dst=0x%04x group=%u filter=%u\n", s_last_dst, s_last_group,
+               s_filter);
+    } else if (!strcmp(cmd, "groups")) {
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            regroup_now();
+            esp_zb_lock_release();
+            printf("groups normalised, one per endpoint\n");
+        } else {
+            printf("stack busy\n");
+        }
+    } else if (!strcmp(cmd, "group") && a1) {
+        const uint16_t id = (uint16_t)atoi(a1);
+        esp_err_t e = ESP_FAIL;
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            e = esp_zb_aps_group_table_add_group(id, PROBE_ENDPOINT);
+            esp_zb_lock_release();
+        }
+        printf("group %u: %s\n", id, esp_err_to_name(e));
+    } else if (!strcmp(cmd, "filter") && a1) {
+        s_filter = strcmp(a1, "any") ? (uint16_t)atoi(a1) : 0;
+        printf("filter=0x%04x (%u)\n", s_filter, s_filter);
+    } else if (!strcmp(cmd, "chan") && a1 && a2) {
+        const int c = atoi(a1), act = action_from_name(a2);
+        if (c < 1 || c > 3 || act < 0) {
+            printf("bad chan, try: chan 3 blink\n");
+        } else {
+            s_cfg.chan[c - 1] = (uint8_t)act;
+            printf("chan %d (group %u) -> %s\n", c, PROBE_GROUPS[c - 1],
+                   ACT_NAMES[act]);
+        }
+    } else if (!strcmp(cmd, "blink") && a1) {
+        s_cfg.blink = (uint8_t)atoi(a1);
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "radio") && a1) {
+        const int ch = atoi(a1);
+        if (ch < 11 || ch > 26) {
+            printf("channel must be 11-26\n");
+        } else if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            esp_zb_set_primary_network_channel_set(1l << ch);
+            esp_zb_lock_release();
+            printf("primary channel set to %d, effective at next commissioning\n",
+                   ch);
+        }
+    } else if (!strcmp(cmd, "keyseq") && a1) {
+        if (!strcmp(a1, "off")) {
+            for (uint8_t s = 0; s < 4; s++)
+                esp_zb_scheduler_alarm_cancel(try_key_sequence, s);
+            printf("automatic key sequence sweep cancelled\n");
+        } else {
+            try_key_sequence((uint8_t)atoi(a1));
+        }
+    } else if (!strcmp(cmd, "rxlog") && a1) {
+        s_rxlog = !strcmp(a1, "on");
+        printf("rxlog %s\n", s_rxlog ? "on" : "off");
+    } else if (!strcmp(cmd, "factory")) {
+        if (a1 && !strcmp(a1, "yes")) {
+            printf("factory reset, this drops the pairing\n");
+            fflush(stdout);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_zb_factory_reset();
+        } else {
+            printf("this wipes the Touchlink pairing, confirm with: factory yes\n");
+        }
+    } else if (!strcmp(cmd, "reboot")) {
+        printf("rebooting\n");
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+    } else if (!strcmp(cmd, "blip")) {
+        s_last_blip = 0;
+        light_blip();
+        s_light_seen = true;
+    } else if (!strcmp(cmd, "save")) {
+        light_save();
+        printf("saved\n");
+    } else if (!strcmp(cmd, "load")) {
+        light_load();
+        light_status();
+    } else if (!strcmp(cmd, "defaults")) {
+        s_cfg.map[GEST_CLICK] = ACT_MODE;
+        s_cfg.map[GEST_DOUBLE] = ACT_ONOFF;
+        s_cfg.map[GEST_SCROLL] = ACT_ACTIVE;
+        light_status();
+    } else {
+        printf("unknown: %s (try help)\n", cmd);
+    }
+}
+
+/* Read through the driver rather than stdin: the ZBOSS stack destabilises the
+ * USB-Serial-JTAG and the blocking ROM path is what drops out under load. */
+static void console_task(void *arg)
+{
+    char line[128];
+    int n = 0;
+    while (true) {
+        uint8_t ch;
+        int got = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(100));
+        if (got != 1) continue;
+        if (ch == '\r' || ch == '\n') {
+            if (n) {
+                line[n] = 0;
+                console_line(line);
+                n = 0;
+            }
+            continue;
+        }
+        if (n < (int)sizeof(line) - 1) line[n++] = (char)ch;
+    }
+}
+
+static void console_start(void)
+{
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "console: driver install failed");
+        return;
+    }
+    usb_serial_jtag_vfs_use_driver();
+    light_load();
+    xTaskCreate(console_task, "console", 4096, NULL, 3, NULL);
+    ESP_LOGW(TAG, "console ready, type help");
+}
+
 static void led_task(void *arg)
 {
     int t = 0;
@@ -87,6 +532,31 @@ static void led_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(150));
             led_set(0, 0, 0);
             vTaskDelay(pdMS_TO_TICKS(150));
+        } else if (s_rx_blip > 0) {
+            s_rx_blip = 0;
+            led_set(255, 255, 255);
+            vTaskDelay(pdMS_TO_TICKS(35));
+            light_render();
+            vTaskDelay(pdMS_TO_TICKS(35));
+        } else if (s_mode_blips > 0) {
+            /* Blink so a mode swap is visible even at a steady colour. */
+            s_mode_blips--;
+            led_set(0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(70));
+            light_render();
+            vTaskDelay(pdMS_TO_TICKS(110));
+        } else if (s_light_seen) {
+            if (s_cfg.blink && s_cfg.on) {
+                /* 254 maps to about 60 ms on, 1 to about a second. */
+                const int half = 1000 - (int)s_cfg.blink * 37 / 10;
+                led_set(0, 0, 0);
+                vTaskDelay(pdMS_TO_TICKS(half < 60 ? 60 : half));
+                light_render();
+                vTaskDelay(pdMS_TO_TICKS(half < 60 ? 60 : half));
+            } else {
+                light_render();
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
         } else {
             /* Slow blue breathe: alive, network open, nothing heard yet. */
             int v = (t < 30) ? t : (60 - t);
@@ -141,27 +611,37 @@ static esp_err_t action_handler(esp_zb_core_action_callback_id_t id,
     switch (id) {
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID: {
         const esp_zb_zcl_set_attr_value_message_t *m = message;
-        s_cmd_flashes += 2;
+        if (!s_light_seen) s_cmd_flashes += 2;
         ESP_LOGW(TAG, "ATTR  ep=%d cluster=0x%04x (%s) attr=0x%04x len=%d",
                  m->info.dst_endpoint, m->info.cluster,
                  cluster_name(m->info.cluster), m->attribute.id,
                  m->attribute.data.size);
+        uint32_t v = 0;
         if (m->attribute.data.value && m->attribute.data.size <= 4) {
-            uint32_t v = 0;
             memcpy(&v, m->attribute.data.value, m->attribute.data.size);
             ESP_LOGW(TAG, "      value=%lu", (unsigned long)v);
         }
+        if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL &&
+            m->attribute.id == ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID) {
+            light_gesture(GEST_SCROLL, (uint8_t)v);
+        }
+        /* On/Off is handled in raw_command: the remote alternates on and off,
+         * and a repeat of the value it already set raises no attribute
+         * change at all, so the click would be lost here. */
         break;
     }
     case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID: {
         /* IKEA sends its arrow buttons as manufacturer-specific commands,
          * which arrive here rather than as attribute writes. */
         const esp_zb_zcl_custom_cluster_command_message_t *m = message;
-        s_cmd_flashes += 2;
+        if (!s_light_seen) s_cmd_flashes += 2;
         ESP_LOGW(TAG, "CUSTOM ep=%d cluster=0x%04x (%s) cmd=0x%02x size=%d",
                  m->info.dst_endpoint, m->info.cluster,
                  cluster_name(m->info.cluster), m->info.command.id,
                  m->data.size);
+        /* The arrow commands are the only manufacturer-specific traffic this
+         * remote sends, and a double click is what emits them. */
+        light_gesture(GEST_DOUBLE, 0);
         break;
     }
     case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
@@ -181,14 +661,75 @@ static esp_err_t action_handler(esp_zb_core_action_callback_id_t id,
  * APS destination, and that is the only way to tell which of its channels a
  * press came from. Take the raw buffer to see it, then let the stack carry on.
  */
+/* A groupcast rides inside an NWK broadcast, so the ZCL header's dst_addr
+ * shows 0xfffd and the group id is only visible here, in the APS indication.
+ * This is the field that carries the BILRESA channel. */
+/* The remote sends every Groups command to endpoint 1, so binding a channel
+ * clears endpoint 1's membership and adds that channel's group there. That
+ * breaks the one-group-per-endpoint layout the channel attribution depends
+ * on, so put it back after any Groups traffic. */
+static void regroup_alarm(uint8_t param)
+{
+    regroup_now();
+}
+
+static bool aps_indication(esp_zb_apsde_data_ind_t ind)
+{
+    const int ch = (int)ind.dst_endpoint - PROBE_ENDPOINT;
+    s_last_channel = (ch >= 0 && ch < (int)PROBE_GROUP_COUNT) ? ch : -1;
+    s_last_group = (s_last_channel >= 0) ? PROBE_GROUPS[s_last_channel] : 0;
+    if (ind.cluster_id == ESP_ZB_ZCL_CLUSTER_ID_GROUPS) {
+        esp_zb_scheduler_alarm_cancel(regroup_alarm, 0);
+        esp_zb_scheduler_alarm(regroup_alarm, 0, 1500);
+    }
+    if (s_rxlog) {
+        ESP_LOGW(TAG, "APS   src=0x%04x dst=0x%04x mode=0x%02x ep=%d chan=%d "
+                      "group=%u cluster=0x%04x lqi=%d",
+                 ind.src_short_addr, ind.dst_short_addr, ind.dst_addr_mode,
+                 ind.dst_endpoint, s_last_channel + 1, s_last_group,
+                 ind.cluster_id, ind.lqi);
+    }
+    return false;   /* not consumed, normal processing continues */
+}
+
+static void regroup_now(void)
+{
+    for (size_t i = 0; i < PROBE_GROUP_COUNT; i++) {
+        for (size_t e = 0; e < PROBE_GROUP_COUNT; e++) {
+            if (e == i) continue;
+            esp_zb_aps_group_table_remove_group(PROBE_GROUPS[i],
+                                                PROBE_EP_OF_CHANNEL(e));
+        }
+        const esp_err_t r = esp_zb_aps_group_table_add_group(
+            PROBE_GROUPS[i], PROBE_EP_OF_CHANNEL(i));
+        ESP_LOGW(TAG, "regroup: %u on ep %d: %s", PROBE_GROUPS[i],
+                 PROBE_EP_OF_CHANNEL(i), esp_err_to_name(r));
+    }
+}
+
 static bool raw_command(uint8_t bufid)
 {
     const zb_zcl_parsed_hdr_t *h = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
     if (h) {
         const uint16_t dst = h->addr_data.common_data.dst_addr;
-        ESP_LOGW(TAG, "RAW   src=0x%04x dst=0x%04x%s ep %d->%d cluster=0x%04x cmd=0x%02x",
+        const uint8_t fc = h->addr_data.common_data.fc;
+        /* APS frame control bits 2-3 are the delivery mode. A groupcast is
+         * carried inside an NWK broadcast, so the NWK destination alone
+         * cannot tell a group frame from a plain broadcast. */
+        static const char *DELIVERY[4] = {"unicast", "indirect", "bcast", "group"};
+        const uint8_t mode = (fc >> 2) & 0x3;
+        s_last_dst = dst;
+        if (h->cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+            (h->cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID ||
+             h->cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ||
+             h->cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID)) {
+            light_gesture(GEST_CLICK, 0);
+        }
+        if (!s_rxlog) return false;
+        ESP_LOGW(TAG, "RAW   src=0x%04x dst=0x%04x %s (fc=0x%02x) ep %d->%d "
+                      "cluster=0x%04x cmd=0x%02x",
                  h->addr_data.common_data.source.u.short_addr, dst,
-                 dst >= 0x8000 ? "" : " (group)",
+                 DELIVERY[mode], fc,
                  h->addr_data.common_data.src_endpoint,
                  h->addr_data.common_data.dst_endpoint,
                  h->cluster_id, h->cmd_id);
@@ -256,9 +797,10 @@ static void report_network_key(const char *when)
 }
 
 /* NWK status 0x12 says a frame arrived with a key sequence number we do not
- * hold. Report the key we ended up with, then try the plausible sequence
- * numbers in turn. If one of them stops the errors, the key material was fine
- * and only the sequence number disagreed. */
+ * hold. This switches the local sequence once, on request from the console.
+ * It used to run automatically after every pairing and chain through 0, 1 and
+ * 2, which changed the key out from under a working link and stopped
+ * reception dead. Leave it manual. */
 static void try_key_sequence(uint8_t param)
 {
     const uint8_t seq = (uint8_t)param;
@@ -276,9 +818,6 @@ static void try_key_sequence(uint8_t param)
              key[0], key[1], key[2], key[3], zero ? " (ALL ZERO)" : "", seq);
     const esp_err_t err = esp_zb_secur_network_key_switch(key, seq);
     ESP_LOGW(TAG, "key switch to seq %u: %s", seq, esp_err_to_name(err));
-    if (seq < 2) {
-        esp_zb_scheduler_alarm(try_key_sequence, seq + 1, 10000);
-    }
 }
 
 static bool touchlink_allow(uint8_t action)
@@ -383,13 +922,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal)
 
     case ESP_ZB_BDB_SIGNAL_TOUCHLINK_TARGET_FINISHED:
         report_network("target finished");
-        esp_zb_scheduler_alarm(try_key_sequence, 0, 8000);
-        for (size_t i = 0; i < sizeof(PROBE_GROUPS) / sizeof(PROBE_GROUPS[0]); i++) {
-            const esp_err_t g = esp_zb_aps_group_table_add_group(PROBE_GROUPS[i],
-                                                                 PROBE_ENDPOINT);
-            ESP_LOGW(TAG, "group %u on endpoint %d: %s", PROBE_GROUPS[i],
-                     PROBE_ENDPOINT, esp_err_to_name(g));
-        }
+        regroup_now();
         break;
 
     case ESP_ZB_BDB_SIGNAL_STEERING:
@@ -439,10 +972,29 @@ static void zigbee_task(void *arg)
         clusters, esp_zb_level_cluster_create(&level_cfg),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+    /* Endpoints 2 and 3 carry the same light clusters as endpoint 1, so a
+     * groupcast for channel 2 or 3 has somewhere to be delivered. */
+    for (size_t i = 1; i < PROBE_GROUP_COUNT; i++) {
+        esp_zb_on_off_light_cfg_t extra_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
+        esp_zb_cluster_list_t *extra = esp_zb_on_off_light_clusters_create(&extra_cfg);
+        esp_zb_level_cluster_cfg_t extra_level = {.current_level = 128};
+        esp_zb_cluster_list_add_level_cluster(
+            extra, esp_zb_level_cluster_create(&extra_level),
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+        const esp_zb_endpoint_config_t epc = {
+            .endpoint = PROBE_EP_OF_CHANNEL(i),
+            .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+            .app_device_id = ESP_ZB_HA_ON_OFF_LIGHT_DEVICE_ID,
+            .app_device_version = 0,
+        };
+        esp_zb_ep_list_add_ep(ep, extra, epc);
+    }
+
     esp_zb_device_register(ep);
     esp_zb_core_action_handler_register(action_handler);
     esp_zb_touchlink_action_check_register(touchlink_allow);
     esp_zb_raw_command_handler_register(raw_command);
+    esp_zb_aps_data_indication_handler_register(aps_indication);
     /* Touchlink is proximity-based and rejects weak signals; relax it so the
      * remote does not have to be pressed against the board. */
     install_master_key();
@@ -464,6 +1016,7 @@ void app_main(void)
     esp_log_level_set("ESP_ZB_*", ESP_LOG_DEBUG);
     esp_log_level_set("ZBOSS", ESP_LOG_DEBUG);
     led_start();
+    console_start();
     /* esp_zb_platform_config() must come first: it brings up the shared radio
      * PHY. Start Wi-Fi before it and the PHY is never initialised for Wi-Fi --
      * a scan then sees zero access points and every connect fails with reason

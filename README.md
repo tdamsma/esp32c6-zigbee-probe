@@ -106,72 +106,92 @@ again fails with "cluster ID:0x5 is already existed".
 
 ## Destination group addresses
 
-The incoming attribute-write callback provides `status`, `dst_endpoint` and
-`cluster`, but omits the APS destination address. An integration using only this
-callback cannot distinguish a remote's channels by their destination group.
-
 A remote bound through Touchlink sends groupcasts to a fixed group ID for each
-channel. BILRESA uses 21658, 21659 and 21660. Read the destination address from
-the raw buffer to capture it:
+channel. BILRESA uses 21658, 21659 and 21660. Recovering that ID is harder than
+it looks, because the SDK does not hand it to the application anywhere.
+
+The attribute-write callback provides `status`, `dst_endpoint` and `cluster`,
+and omits addressing entirely. The raw command handler provides
+`zb_zcl_parsed_hdr_t`, whose `addr_data.common_data.dst_addr` is 0xfffd for a
+groupcast, since an APS groupcast travels inside a network layer broadcast. The
+APS data indication provides `esp_zb_apsde_data_ind_t`, which reports
+`dst_addr_mode=0x02` and `dst_short_addr=0xfffd` for these frames, the group ID
+having already been resolved away.
+
+What the parsed header does carry is the APS frame control, so a groupcast can
+at least be told apart from a real broadcast. Bits 2 and 3 of `fc` are the
+delivery mode, where 3 means group:
 
 ```c
 static bool raw_command(uint8_t bufid)
 {
     const zb_zcl_parsed_hdr_t *h = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
-    uint16_t dst = h->addr_data.common_data.dst_addr;   /* group id for a groupcast */
+    uint8_t mode = (h->addr_data.common_data.fc >> 2) & 0x3;  /* 3 = group */
     return false;  /* not consumed -- normal processing continues */
 }
 esp_zb_raw_command_handler_register(raw_command);
 ```
 
-The probe logs this address in a `RAW` line alongside each decoded command.
-Returning `false` allows the stack to continue processing the command normally.
+To recover the channel itself, give each group its own endpoint, 21658 on
+endpoint 1, 21659 on endpoint 2 and 21660 on endpoint 3. Group delivery is
+resolved against the APS group table before the indication is raised, so
+`dst_endpoint` identifies the channel. The probe logs this in an `APS` line as
+`ep=2 chan=2 group=21659`.
+
+Note that the remote sends its Groups commands to endpoint 1 whenever a channel
+is bound, starting with Remove All Groups, which destroys this layout. The probe
+re-asserts it 1.5 seconds after any Groups cluster traffic.
 
 ### Touchlink
 
 The full procedure and evidence are in
 [TOUCHLINK-INVESTIGATION.md](TOUCHLINK-INVESTIGATION.md).
 
-Touchlink was tested against an IKEA BILRESA E2490 and does not reach a usable
-link. The findings are worth recording because each stage fails differently.
+Touchlink works against an IKEA BILRESA E2490 and gives per channel control
+with no hub. Four things are needed, and the first two were what blocked it for
+a long time.
 
-A coordinator is the wrong role. While the probe formed its own network as
-coordinator, the remote's Touchlink scan produced nothing at all, and the
-callback registered with `esp_zb_touchlink_action_check_register()` never fired.
-A remote that is off network does not join an existing network during Touchlink.
-It creates one and adopts the target, which a coordinator cannot accept. Set
-`PROBE_ROLE_ROUTER` to stay factory new and joinable.
+**Router role.** A coordinator is the wrong role. While the probe formed its own
+network as coordinator, the remote's Touchlink scan produced nothing at all, and
+the callback registered with `esp_zb_touchlink_action_check_register()` never
+fired. A remote that is off network does not join an existing network during
+Touchlink. It creates one and adopts the target, which a coordinator cannot
+accept. Keep `PROBE_ROLE_ROUTER` enabled.
 
-As a router the handshake starts correctly:
-
-```
-*** TOUCHLINK request, action=1 -- allowing ***
-signal 15 BDB Touchlink Network (ESP_OK)
-group 21658 on endpoint 1: ESP_OK
-```
-
-It then fails at the network key. Every frame from the remote is rejected:
+**No automatic key sequence switching.** Every frame being rejected with
 
 ```
 NLME status 0x12 from 0x0001    ZB_NWK_COMMAND_STATUS_BAD_KEY_SEQUENCE_NUMBER
 ```
 
-repeating every few seconds, and the remote's LED keeps blinking because its
-initiator never sees the exchange complete. No ZCL traffic reaches the
-application, so the group addressing described above was never exercised
-against real traffic.
+was caused by the probe's own diagnostic. An alarm scheduled from
+`TOUCHLINK_TARGET_FINISHED` swept the local key sequence through 0, 1 and 2,
+which moved it away from the one the remote uses. `keyseq <n>` on the console is
+now a one shot for deliberate use, and nothing switches the key on its own. The
+switch persists across a reboot, so a board left in this state stays broken
+until the sequence is put back.
 
-Touchlink encrypts the transferred network key with either the certification
-key, index 15, which is public and intended for testing, or the master key,
-index 4, which is shared by certified Touchlink devices. The SDK advertises both
-by default and prefers the certification key, because priority follows the
-higher bit. Key handling is therefore the remaining suspect, but status 0x12
-reports a network security state problem and does not identify which key was
-selected. Installing a master key with `PROBE_TOUCHLINK_MASTER_KEY`, which makes
-the probe advertise the master key alone, is untested.
+**The ZLL master key, advertised alone.** `PROBE_TOUCHLINK_MASTER_KEY` set to
+`9F55************************EE31` makes the probe advertise the master key,
+index 4, on its own, so the selected key index is unambiguous. Commissioning
+completes on this path, though it has not been shown that the default, which
+advertises both keys, would fail.
 
-Note also that the remote must be factory reset first. While it was commissioned
-over Matter, the four press Touchlink sequence produced nothing.
+**One endpoint per group**, as described above, which is what makes the channel
+readable.
+
+The remote must be factory reset first. While it was commissioned over Matter,
+the four press Touchlink sequence produced nothing. A reset remote can only bind
+channel 1; channel 2 becomes selectable once channel 1 is bound, and channel 3
+once channel 2 is.
+
+### Serial console
+
+The probe carries a line based console on the USB-Serial-JTAG port, so the light
+behaviour and the Zigbee state can be changed at runtime without reflashing,
+which matters because reflashing is cheap but re-pairing is not. Type `help` for
+the list. It reads through the `usb_serial_jtag` driver rather than `stdin`,
+since the blocking ROM path is what drops out under ZBOSS load.
 
 ## Network startup sequence
 

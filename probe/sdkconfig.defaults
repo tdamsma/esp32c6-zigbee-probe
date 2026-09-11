@@ -10,3 +10,7 @@ CONFIG_FREERTOS_HZ=1000
 # this board's Wi-Fi receiver found zero access points while BLE and
 # 802.15.4 worked, and full calibration fixed it. Costs ~100 ms of boot.
 CONFIG_ESP_PHY_RF_CAL_FULL=y
+
+# ZLL master key (index 4). Set so install_master_key() advertises the master
+# key alone, making the selected Touchlink key unambiguous.
+CONFIG_PROBE_TOUCHLINK_MASTER_KEY="9F55************************EE31"

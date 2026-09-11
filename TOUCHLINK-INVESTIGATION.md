@@ -6,20 +6,25 @@ repeated blindly, and so anyone continuing knows precisely where the wall is.
 
 ## Summary
 
-The remote has two Zigbee paths and neither delivers per channel control.
+Touchlink works, and the three channels are separately identifiable. This was
+achieved on 2026-09-10 and is described in step 10. Steps 1 to 9 below are the
+earlier record, kept because they show which explanations were eliminated and
+because two of the conclusions they reached turned out to be wrong.
 
-Plain Zigbee join works and delivers commands, but a coordinator cannot tell the
-three channels apart, because the channel is only visible in the group address
-of a groupcast and a joined remote does not use one.
+The working configuration is a router role target, the ZLL master key
+advertised alone, no automatic key sequence switching, and one endpoint per
+BILRESA group. With that in place a factory new pairing produces no rejected
+frames at all, and a wheel command on channel 1, 2 or 3 arrives on endpoint 1,
+2 or 3 respectively.
 
-Touchlink would fix that. It reaches network setup and then fails during secured
-communication. From a genuinely factory new board the handshake completes, the
-network parameters are the remote's own, the target joins at short address
-0x0002 alongside the initiator at 0x0001, group membership succeeds, the target
-holds fresh non degenerate key material, and then every frame from the remote is
-rejected with bad key sequence number. Sweeping the key sequence number does not
-help. Explicit configuration of a production master key remains untested with a
-verified key value.
+Two findings from the earlier steps were mistaken. The key sequence sweep was
+not a neutral diagnostic, it was the cause of the rejections. The conclusion
+that the remote broadcasts rather than groupcasts came from reading only the
+network layer destination, which is 0xfffd for both.
+
+Plain Zigbee join is still channel blind and that has not changed. The channel
+is visible only in the group address of a groupcast, and a joined remote does
+not use one.
 
 ## Goal
 
@@ -317,81 +322,162 @@ inconclusive result recorded in step 8. All three plausible sequence numbers
 were applied, each switch was accepted by the stack, and the rejections
 continued unchanged.
 
+## Step 10: the working configuration
+
+Four changes were needed. Each is independent, and the first two had to be in
+place before the last two could be observed at all.
+
+### 10.1 The key sequence sweep was the cause, not a diagnostic
+
+Step 8 added `try_key_sequence()`, scheduled from
+`ESP_ZB_BDB_SIGNAL_TOUCHLINK_TARGET_FINISHED` and chaining through sequence
+numbers 0, 1 and 2 at ten second intervals. It was intended to test whether the
+sequence number was the problem. It was the problem. The alarm re-armed on
+every pairing and switched the local network key sequence away from the one the
+remote uses, after which every frame was rejected with status 0x12.
+
+The evidence is unambiguous. In one run the last lines before traffic stopped
+were:
+
+```
+W (64962) after touchlink: pan 0xf2aa ext_pan 9c139efffecc0afc channel 25 short 0x0002
+W (64963) network key starts 3f6f9c1e, switching to seq 2
+W (64967) key switch to seq 2: ESP_OK
+```
+
+Reception stopped at that instant and did not return across a reboot, because
+the switch persists. Issuing `keyseq 0` from the console restored it
+immediately. Note that `esp_zb_secur_network_key_switch()` is a local
+operation, so it succeeds regardless of what the remote is using.
+
+The sweep is removed. A one shot `keyseq <n>` remains available from the
+console for deliberate use.
+
+### 10.2 The ZLL master key, advertised alone
+
+`PROBE_TOUCHLINK_MASTER_KEY` is set to the ZLL master key,
+`9F55************************EE31`. `install_master_key()` installs it and calls
+`esp_zb_zdo_touchlink_set_key_bitmask(ESP_ZB_TOUCHLINK_MASTER_KEY)` so the
+master key is the only one advertised and the selected index is unambiguous.
+
+Commissioning completes with this key, which answers the question step 7 could
+not: the remote accepts the master key path.
+
+This does not show that the key is required. The SDK advertises both the
+certification key and the master key by default, and that default was never
+retried once the key sequence sweep of 10.1 was found to be the real cause of
+the rejections. The master key may be doing nothing here.
+
+### 10.3 A groupcast arrives with a network destination of 0xfffd
+
+Steps up to here concluded that the remote broadcasts its commands, because the
+destination read from `zb_zcl_parsed_hdr_t.addr_data.common_data.dst_addr` was
+always 0xfffd rather than a group id. That conclusion was wrong.
+
+An APS groupcast is carried inside a network layer broadcast, so 0xfffd is the
+expected network destination for a groupcast and does not distinguish one from
+a true broadcast. The delivery mode is in the APS frame control, bits 2 and 3
+of `addr_data.common_data.fc`, where 0 is unicast, 2 is broadcast and 3 is
+group. Every wheel command from a Touchlink bound BILRESA reads as mode 3:
+
+```
+RAW src=0x0001 dst=0xfffd group (fc=0x0c) ep 1->1 cluster=0x0008 cmd=0x00
+```
+
+The remote had been groupcasting the whole time.
+
+### 10.4 The SDK does not expose the group id, so use one endpoint per group
+
+Knowing the frame is group delivered is not the same as knowing which group.
+`esp_zb_aps_data_indication_handler_register()` looked like the answer, since
+`esp_zb_apsde_data_ind_t` carries `dst_addr_mode` and `dst_short_addr`. It is
+not: for these frames the callback reports `dst_addr_mode=0x02`, a plain 16 bit
+address, and `dst_short_addr=0xfffd`. The group id has already been discarded.
+
+The field that does survive is `dst_endpoint`, because group delivery is
+resolved against the APS group table before the indication is raised. Giving
+each group its own endpoint therefore restores the channel:
+
+| Channel | Group | Endpoint |
+|---|---|---|
+| 1 | 21658 | 1 |
+| 2 | 21659 | 2 |
+| 3 | 21660 | 3 |
+
+Endpoints 2 and 3 are created with the same On/Off and Level server clusters as
+endpoint 1, using `esp_zb_on_off_light_clusters_create()` and
+`esp_zb_ep_list_add_ep()`. A groupcast to 21659 is then delivered to endpoint 2
+and nowhere else.
+
+### 10.5 The remote rewrites endpoint 1 on every bind
+
+Binding a channel sends three unicast commands to endpoint 1: Groups Remove All
+Groups (0x0004 command 0x04), Groups Add Group (0x0004 command 0x00), and
+Identify Trigger Effect (0x0003 command 0x40).
+
+Remove All Groups clears endpoint 1's membership, and Add Group then puts the
+newly bound channel's group on endpoint 1. Both break the layout in 10.4:
+channel 1 stops being received, and the newly bound channel is delivered to two
+endpoints at once. `regroup_now()` restores one group per endpoint, and is
+scheduled 1.5 seconds after any frame on the Groups cluster.
+
+### 10.6 Result
+
+With all three channels bound, wheel commands attribute correctly and no frame
+is rejected:
+
+```
+(72077) APS src=0x0001 dst=0xfffd mode=0x02 ep=1 chan=1 group=21658 cluster=0x0008
+(74141) APS src=0x0001 dst=0xfffd mode=0x02 ep=2 chan=2 group=21659 cluster=0x0008
+(184667) APS src=0x0001 dst=0xfffd mode=0x02 ep=3 chan=3 group=21660 cluster=0x0008
+```
+
+Across that session there were 3 frames on channel 1, 13 on channel 2 and 5 on
+channel 3, following the operator's channel switches in order, with zero
+occurrences of NLME status 0x12.
+
+Two smaller observations from the same work. The group follows the channel
+currently selected on the remote, not the channel that was bound, so a selected
+but unbound channel still groupcasts and is still received, because the target's
+own group membership is what determines delivery. And a single click sends an
+alternating On/Off command rather than Toggle, so a click that repeats the value
+already held raises no attribute change: take the click from the command in the
+raw handler, not from `ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID`.
+
 ## Conclusion
 
-Touchlink reaches network setup and fails during secured communication.
-Commissioning completes on the target side, the device joins, and group
-membership succeeds, after which every frame from the remote is rejected with
-NWK status 0x12, bad key sequence number.
+Touchlink delivers per channel control from a BILRESA E2490 with no hub. The
+wall described in steps 1 to 9 was self inflicted: the key sequence sweep added
+to diagnose the rejections was generating them.
 
-The roles, the channel, proximity, group membership and the receive path are all
-ruled out, since each was changed or verified independently. Key handling is the
-remaining candidate, and it is not proven. Status 0x12 reports a network
-security state problem. It does not identify which key was selected, nor show
-that particular key bytes are wrong.
+The channel identity is recoverable, but not from the field the earlier steps
+looked at. The group id is absent from both the parsed ZCL header and the APS
+data indication. Mapping each group to its own endpoint and reading
+`dst_endpoint` is what makes it observable.
 
-Installing a master key and advertising it alone was exercised with an
-unverified key value, so it discriminates nothing. The value could not be
-confirmed against a published source.
+The over the air capture with a second radio, recommended at the end of step 9,
+was never needed.
 
-The key the target ends up holding is plausible material rather than a
-degenerate value, which argues against a failed key exchange.
+## How to reproduce
 
-The sequence number sweep is a clean negative once it is run from a factory new
-board, as described in step 9. All three plausible sequence numbers were applied
-and accepted, traffic was present throughout, and the rejections continued
-unchanged.
+1. Set `PROBE_TOUCHLINK_MASTER_KEY` to `9F55************************EE31` and
+   keep `PROBE_ROLE_ROUTER` enabled.
+2. `idf.py erase-flash` then `idf.py flash`. Resetting the board is not enough.
+3. Factory reset the remote by holding the pair button for about ten seconds,
+   releasing when the amber pulse starts.
+4. Confirm the baseline boot line reads
+   `pan 0xffff ext_pan 0000000000000000 channel 255 short 0xfffe`. If it does
+   not, the run is invalid.
+5. Four rapid presses of the pair button with the remote held against the board
+   binds channel 1. The front bottom button then unlocks channel 2, and channel
+   3 after that. A reset remote cannot select channel 2 until channel 1 is
+   bound.
+6. Turn the wheel on each channel and check the `APS` lines for
+   `ep=1 chan=1 group=21658`, `ep=2 chan=2 group=21659` and
+   `ep=3 chan=3 group=21660`.
 
-The network layer is not the problem. The negotiated PAN id, channel and short
-addresses are all the remote's own, so the two devices are on one network and
-the failure is confined to security.
-
-The honest state is that Touchlink negotiates, the target joins with usable
-looking key material, the initiator is never satisfied and resumes scanning, and
-the few frames that do arrive after commissioning are rejected with status 0x12.
-The cause is not identified.
-
-Further progress needs an over the air capture with a second radio, so that the
-negotiated key index, the network key transfer and the security headers of the
-rejected frames can be read directly rather than inferred. Everything short of
-that has been guesswork, and this document is a record of which guesses were
-eliminated.
-
-## What remains untested
-
-Because no traffic ever reached the application, the group addressing path was
-never exercised against real commands. The raw command handler that reads the
-APS destination from `zb_zcl_parsed_hdr_t.addr_data.common_data.dst_addr` is
-written and compiles, but whether the group id appears there for this remote's
-groupcasts is unverified.
-
-Anyone resuming with a working key should start there, turn the wheel on each of
-the three channels, and check whether the `RAW` lines show 0x549a, 0x549b and
-0x549c.
-
-## Where to resume
-
-The next experiment, in order:
-
-1. Set `PROBE_TOUCHLINK_MASTER_KEY` to the production master key. The probe
-   installs it and then advertises the master key only, so the selected key is
-   unambiguous.
-2. Keep `PROBE_ROLE_ROUTER` enabled, erase flash on the board and factory reset
-   the remote, so neither side carries stale network state. Confirm the baseline
-   really is factory new by checking that the boot line reads
-   `pan 0xffff ext_pan 0000000000000000 channel 255 short 0xfffe`. Resetting the
-   board is not enough, the flash must be erased.
-3. Repeat step 4 and watch two things: whether the remote's LED stops blinking,
-   and whether `NLME status 0x12` disappears.
-4. If 0x12 persists, capture the exchange over the air and check which key index
-   was negotiated before drawing conclusions about the key bytes.
-5. If commands start arriving, turn the wheel on each of the three channels and
-   check whether the `RAW` lines show destination groups 0x549a, 0x549b and
-   0x549c.
-
-Note that steps 3 and 5 are separate results. Successful commissioning would not
-by itself demonstrate that the three channels are distinguishable at the
-application layer.
+The serial console added for this work drives all of it at runtime, so changing
+the gesture mapping does not require a rebuild. `help` lists the commands.
 
 ## The alternative that does work
 
