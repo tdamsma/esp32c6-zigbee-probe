@@ -5,15 +5,20 @@ config PROBE_TOUCHLINK_MASTER_KEY
     default ""
     help
         The Touchlink master key, index 4, is used by certified Touchlink
-        devices to encrypt the transferred network key. It is not included in
-        this SDK. Leave empty to use the SDK defaults, which advertise both the
-        certification and master keys and prefer the certification key because
-        it has the higher bit.
+        devices to encrypt the transferred network key. It is not shipped with
+        this SDK. When set, it is installed and advertised alone, so there is no
+        ambiguity about which key the two sides selected.
 
-        When set, the key is installed and only the master key is advertised, so
-        there is no ambiguity about which key the two sides selected. This is
-        the working configuration for a BILRESA E2490, with the widely published
-        ZLL master key set in sdkconfig.defaults.
+        Against a BILRESA E2490 this is required, not merely tidy. Left empty,
+        the SDK advertises both the certification key (index 15) and the master
+        key and prefers the certification key, because priority follows the
+        higher bit. Commissioning then still completes and every frame that
+        follows is rejected with NWK status 0x12, so the remote pairs and does
+        nothing. Measured 2026-09-11, step 11 of TOUCHLINK-INVESTIGATION.md.
+
+        sdkconfig.defaults carries the ZLL master key, which has been public
+        since 2016 and is not a secret this repo is keeping. It is the value
+        that works here; no other key was tested.
 
 config PROBE_ROLE_ROUTER
     bool "Join as a router instead of forming a network as coordinator"

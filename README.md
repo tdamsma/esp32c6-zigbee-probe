@@ -195,6 +195,24 @@ which matters because reflashing is cheap but re-pairing is not. Type `help` for
 the list. It reads through the `usb_serial_jtag` driver rather than `stdin`,
 since the blocking ROM path is what drops out under ZBOSS load.
 
+`probe/scripts/` drives it from the host. All three reconnect rather than die
+when the port goes away, which it does: the ZBOSS stack destabilises the C6's
+native USB-Serial-JTAG, and a read on a port that has gone will otherwise block
+forever.
+
+| Script | Use |
+|---|---|
+| `light_console.py` | Interactive session, or `--cmd` for scripted one-shots |
+| `resilient_capture.py` | Long unattended capture |
+| `identify_echo.py` | Sends Identify while the remote is awake, see below |
+
+The remote is a sleepy end device, so a unicast sent while it is idle is held
+for indirect delivery and expires with `NLME status 0x06`. `identify_echo.py`
+sends on a timer while the operator keeps the wheel turning, which is what holds
+the receiver open. Measured 2026-09-11: 15 of 25 commands landed with the wheel
+moving and 1 expired, against 95 expiries in a control run where the remote was
+never touched. It blinks all three LEDs, matching the Matter behaviour.
+
 ## Network startup sequence
 
 ```

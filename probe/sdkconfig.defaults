@@ -11,8 +11,10 @@ CONFIG_FREERTOS_HZ=1000
 # 802.15.4 worked, and full calibration fixed it. Costs ~100 ms of boot.
 CONFIG_ESP_PHY_RF_CAL_FULL=y
 
-# ZLL master key (index 4). Set so install_master_key() advertises the master
-# key alone, making the selected Touchlink key unambiguous.
+# ZLL master key (index 4), public since 2016. Required against a BILRESA
+# E2490: with the SDK default, which advertises both this and the certification
+# key and prefers the certification key, commissioning completes and then every
+# frame is rejected with NWK status 0x12. See TOUCHLINK-INVESTIGATION.md step 11.
 CONFIG_PROBE_TOUCHLINK_MASTER_KEY="9F55************************EE31"
 
 # Router role. A coordinator cannot be adopted as a Touchlink target: the
