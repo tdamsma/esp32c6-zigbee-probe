@@ -171,8 +171,8 @@ now a one shot for deliberate use, and nothing switches the key on its own. The
 switch persists across a reboot, so a board left in this state stays broken
 until the sequence is put back.
 
-**The ZLL master key, advertised alone.** `PROBE_TOUCHLINK_MASTER_KEY` set to
-`9F55************************EE31` makes the probe advertise the master key,
+**The ZLL Master Key, advertised alone.** `PROBE_TOUCHLINK_MASTER_KEY` set to
+the ZLL Master Key `9F55************************EE31`, leaked by MayaZigBee in 2015, makes the probe advertise the master key,
 index 4, on its own, so the selected key index is unambiguous. It is required:
 with the SDK default, which advertises both keys and prefers the certification
 key, commissioning still completes but every subsequent frame is rejected with
