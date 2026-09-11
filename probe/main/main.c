@@ -55,6 +55,10 @@
  * receives a groupcast if its endpoint is a member of that group, so join all
  * three to see traffic from any channel. */
 static const uint16_t PROBE_GROUPS[] = {21658, 21659, 21660};
+
+/* Scenes command sent on a wheel double click. Captured 2026-09-11;
+ * the remote sends nothing else for that gesture. */
+#define BILRESA_SCENES_DOUBLE_CLICK 0x07
 #define PROBE_GROUP_COUNT (sizeof(PROBE_GROUPS) / sizeof(PROBE_GROUPS[0]))
 
 /* The SDK's APS callback reports a groupcast as a plain broadcast and drops
@@ -775,6 +779,14 @@ static bool raw_command(uint8_t bufid)
              h->cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID)) {
             light_gesture(GEST_CLICK, 0);
         }
+        /* The double click is not a manufacturer-specific command, which is
+         * what ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID was written for and
+         * why that callback never fired. It arrives as Scenes command 0x07,
+         * one frame per double click, alongside no other traffic. */
+        if (h->cluster_id == ESP_ZB_ZCL_CLUSTER_ID_SCENES &&
+            h->cmd_id == BILRESA_SCENES_DOUBLE_CLICK) {
+            light_gesture(GEST_DOUBLE, 0);
+        }
         if (!s_rxlog) return false;
         ESP_LOGW(TAG, "RAW   src=0x%04x dst=0x%04x %s (fc=0x%02x) ep %d->%d "
                       "cluster=0x%04x cmd=0x%02x",
@@ -925,6 +937,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal)
             ESP_LOGE(TAG, "initialisation failed: %s", esp_err_to_name(err));
             break;
         }
+        /* The APS group table is restored from NVS, and any bind the remote
+         * has done since the layout was last asserted leaves endpoint 1 a
+         * member of another channel's group. That endpoint then receives a
+         * second copy of every frame for that channel, so two channels act
+         * at once. Re-assert on every boot, not only after a pairing. */
+        if (!esp_zb_bdb_is_factory_new()) regroup_now();
         if (CONFIG_PROBE_ROLE_ROUTER) {
             /* Stay factory new and wait to be adopted. A remote that is off
              * network creates one during Touchlink and pulls the target in,
