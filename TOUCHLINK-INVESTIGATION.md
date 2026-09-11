@@ -355,8 +355,12 @@ console for deliberate use.
 
 ### 10.2 The ZLL master key, advertised alone
 
-`PROBE_TOUCHLINK_MASTER_KEY` is set to the ZLL Master Key `9F55************************EE31`, leaked by MayaZigBee in 2015.
-`install_master_key()` installs it and calls
+`PROBE_TOUCHLINK_MASTER_KEY` is set to the ZLL Master Key `9F55************************EE31`,
+posted by [MayaZigBee on 2015-03-22](https://xcancel.com/MayaZigBee/status/579723961661022209)
+and [discussed on Hacker News](https://news.ycombinator.com/item?id=9249753)
+the next day, where it was later redacted after a DMCA takedown request. It has
+been republished continuously since and is built into ZigBee penetration
+testing tools. `install_master_key()` installs it and calls
 `esp_zb_zdo_touchlink_set_key_bitmask(ESP_ZB_TOUCHLINK_MASTER_KEY)` so the
 master key is the only one advertised and the selected index is unambiguous.
 
