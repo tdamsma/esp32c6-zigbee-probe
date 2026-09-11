@@ -173,9 +173,11 @@ until the sequence is put back.
 
 **The ZLL master key, advertised alone.** `PROBE_TOUCHLINK_MASTER_KEY` set to
 `9F55************************EE31` makes the probe advertise the master key,
-index 4, on its own, so the selected key index is unambiguous. Commissioning
-completes on this path, though it has not been shown that the default, which
-advertises both keys, would fail.
+index 4, on its own, so the selected key index is unambiguous. It is required:
+with the SDK default, which advertises both keys and prefers the certification
+key, commissioning still completes but every subsequent frame is rejected with
+status 0x12 and no traffic ever arrives. Tested 2026-09-11, step 11 of the
+investigation.
 
 **One endpoint per group**, as described above, which is what makes the channel
 readable.

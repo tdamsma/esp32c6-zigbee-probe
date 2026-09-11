@@ -363,10 +363,9 @@ master key is the only one advertised and the selected index is unambiguous.
 Commissioning completes with this key, which answers the question step 7 could
 not: the remote accepts the master key path.
 
-This does not show that the key is required. The SDK advertises both the
-certification key and the master key by default, and that default was never
-retried once the key sequence sweep of 10.1 was found to be the real cause of
-the rejections. The master key may be doing nothing here.
+Whether the key was required was left open here, because the SDK default was
+never retried once the key sequence sweep of 10.1 was found to be the real
+cause of the rejections. Step 11 closes it: the default fails.
 
 ### 10.3 A groupcast arrives with a network destination of 0xfffd
 
@@ -478,6 +477,53 @@ was never needed.
 
 The serial console added for this work drives all of it at runtime, so changing
 the gesture mapping does not require a rebuild. `help` lists the commands.
+
+## Step 11: the master key is required, tested 2026-09-11
+
+Step 10.2 installed the ZLL master key and noted that this did not show the key
+was needed, because the SDK default was never retried once the key sequence
+sweep was found to be the real cause of the earlier rejections. That comparison
+has now been made, with the sweep gone so it cannot confound the result.
+
+`PROBE_TOUCHLINK_MASTER_KEY` empty, which leaves the SDK defaults advertising
+both the certification key (index 15) and the master key (index 4) and
+preferring the certification key because it has the higher bit. Otherwise the
+procedure above, unchanged: erase-flash, a factory reset remote, and a verified
+`pan 0xffff ext_pan 0000000000000000 channel 255 short 0xfffe` baseline.
+
+Commissioning completes:
+
+```
+W (93068) *** TOUCHLINK request, action=0 -- allowing ***
+W (96368) target finished: pan 0x29df ext_pan 9c139efffecc0afc channel 11 short 0x0002
+W (96376) regroup: 21658 on ep 1: ESP_OK
+```
+
+and then nothing works:
+
+```
+W (97561)  NLME status 0x12 from 0x0001
+W (104483) NLME status 0x12 from 0x0001
+W (110766) NLME status 0x12 from 0x0001
+...
+```
+
+Nine rejections over two minutes, zero APS frames, zero
+attribute writes, no wheel command of any kind, and the remote's LEDs kept
+blinking because its initiator never saw the exchange complete. That is the
+step 7 failure reproduced exactly.
+
+Restoring the key and repeating the same procedure on the same hardware
+minutes later pairs and delivers traffic. The two runs differ in the key alone.
+
+So the answer is that the master key is required, and the caveat attached to
+10.2 is resolved. `c22114def...` was not tested, because
+the question it was being held in reserve for is now answered.
+
+Note what this does not say. It does not say the certification key is rejected
+outright, only that the SDK default, which advertises both and prefers the
+certification key, fails against this remote. Advertising the certification key
+alone was not tested.
 
 ## The alternative that does work
 
