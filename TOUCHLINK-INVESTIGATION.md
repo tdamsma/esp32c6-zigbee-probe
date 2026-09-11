@@ -85,6 +85,13 @@ Touchlink. It starts a network of its own and adopts the target into it. A
 coordinator that has already formed a network cannot be adopted, so it never
 answers a scan request in a way that leads anywhere.
 
+Confirmed upstream after the fact:
+[esp-zigbee-sdk#781](https://github.com/espressif/esp-zigbee-sdk/issues/781)
+records the same coordinator-role failure on ESP-IDF v5.5.2, and Espressif
+maintainer xieqinan confirms that Touchlink only works on distributed networks,
+pointing at the SDK's distributed-network Touchlink example. So this is by
+design, not a bug that a later SDK will fix.
+
 The target therefore has to be factory new and joinable. A `PROBE_ROLE_ROUTER`
 option was added, which selects `ESP_ZB_DEVICE_TYPE_ROUTER` and, instead of
 forming a network, starts Touchlink target mode directly and waits.
