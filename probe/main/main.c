@@ -140,6 +140,10 @@ static volatile int s_mode_blips;
 static volatile int s_rx_blip;         /* one white flash per command */
 static TickType_t s_last_blip;
 static volatile uint16_t s_last_dst = 0xffff;   /* NWK destination last seen */
+/* The remote is the Touchlink initiator, so it takes 0x0001 and the probe
+ * 0x0002. Tracked anyway rather than hardcoded, in case a later pairing
+ * lands differently. */
+static volatile uint16_t s_remote_addr = 0x0001;
 static volatile uint16_t s_last_group;          /* group of the last frame, 0 if none */
 static volatile int s_last_channel = -1;        /* 0-2, from the endpoint */
 static volatile bool s_rxlog = true;
@@ -316,6 +320,8 @@ static void console_help(void)
            "  filter <any|group>         only act on that group, eg 21658\n"
            "  radio <11-26>              primary channel for next commissioning\n"
            "  keyseq <n|off>             switch key sequence, or stop the sweep\n"
+           "  identify [secs] [ep]       send Identify to the remote\n"
+           "  effect [id] [variant] [ep] send Identify Trigger Effect\n"
            "  rxlog on|off               per-frame logging\n"
            "  factory yes | reboot       wipe the pairing / restart\n"
            "  save | load | defaults     gesture map and colour in NVS\n"
@@ -389,6 +395,48 @@ static void console_line(char *line)
             esp_zb_bdb_open_network((uint8_t)secs);
             esp_zb_lock_release();
             printf("network open for %d s\n", secs);
+        }
+    } else if (!strcmp(cmd, "identify")) {
+        /* Whether a Zigbee peer can drive the remote's own LEDs. Over Matter
+         * this is closed: Identify takes command 0 only and IdentifyType is
+         * None. The remote sends Identify itself when a channel binds, so the
+         * reverse direction is worth asking. */
+        esp_zb_zcl_identify_cmd_t c = {
+            .zcl_basic_cmd = {
+                .dst_addr_u.addr_short = s_remote_addr,
+                .dst_endpoint = (uint8_t)(a2 ? atoi(a2) : 1),
+                .src_endpoint = PROBE_ENDPOINT,
+            },
+            .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+            .identify_time = (uint16_t)(a1 ? atoi(a1) : 3),
+        };
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            const uint8_t tsn = esp_zb_zcl_identify_cmd_req(&c);
+            esp_zb_lock_release();
+            printf("identify %u s to 0x%04x ep %u, tsn %u\n", c.identify_time,
+                   s_remote_addr, c.zcl_basic_cmd.dst_endpoint, tsn);
+        } else {
+            printf("stack busy\n");
+        }
+    } else if (!strcmp(cmd, "effect")) {
+        esp_zb_zcl_identify_trigger_effect_cmd_t c = {
+            .zcl_basic_cmd = {
+                .dst_addr_u.addr_short = s_remote_addr,
+                .dst_endpoint = (uint8_t)(a3 ? atoi(a3) : 1),
+                .src_endpoint = PROBE_ENDPOINT,
+            },
+            .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+            .effect_id = (uint8_t)(a1 ? strtol(a1, NULL, 0) : 0),
+            .effect_variant = (uint8_t)(a2 ? strtol(a2, NULL, 0) : 0),
+        };
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+            const uint8_t tsn = esp_zb_zcl_identify_trigger_effect_cmd_req(&c);
+            esp_zb_lock_release();
+            printf("effect 0x%02x variant 0x%02x to 0x%04x ep %u, tsn %u\n",
+                   c.effect_id, c.effect_variant, s_remote_addr,
+                   c.zcl_basic_cmd.dst_endpoint, tsn);
+        } else {
+            printf("stack busy\n");
         }
     } else if (!strcmp(cmd, "net")) {
         report_network("now");
@@ -676,6 +724,8 @@ static void regroup_alarm(uint8_t param)
 static bool aps_indication(esp_zb_apsde_data_ind_t ind)
 {
     const int ch = (int)ind.dst_endpoint - PROBE_ENDPOINT;
+    if (ind.src_short_addr && ind.src_short_addr != 0xffff)
+        s_remote_addr = ind.src_short_addr;
     s_last_channel = (ch >= 0 && ch < (int)PROBE_GROUP_COUNT) ? ch : -1;
     s_last_group = (s_last_channel >= 0) ? PROBE_GROUPS[s_last_channel] : 0;
     if (ind.cluster_id == ESP_ZB_ZCL_CLUSTER_ID_GROUPS) {

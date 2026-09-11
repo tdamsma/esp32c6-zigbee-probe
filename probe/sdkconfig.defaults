@@ -14,3 +14,8 @@ CONFIG_ESP_PHY_RF_CAL_FULL=y
 # ZLL master key (index 4). Set so install_master_key() advertises the master
 # key alone, making the selected Touchlink key unambiguous.
 CONFIG_PROBE_TOUCHLINK_MASTER_KEY="9F55************************EE31"
+
+# Router role. A coordinator cannot be adopted as a Touchlink target: the
+# remote creates its own network and adds the target to it. Without this a
+# fresh clone reproduces the failure described in TOUCHLINK-INVESTIGATION.md.
+CONFIG_PROBE_ROLE_ROUTER=y
